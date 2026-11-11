@@ -1384,10 +1384,11 @@ prepared_output_metadata prepare_output_metadata(
       ? reinterpret_cast<int8_t*>(d_packed_readback.data() + valid_counts_size + total_sizes_bytes)
       : nullptr;
   // Zero valid counts before atomicAdds; scans fill totals and callers initialize errors.
-  thrust::uninitialized_fill(rmm::exec_policy_nosync(stream, mr),
-                             reinterpret_cast<std::byte*>(d_valid_counts),
-                             reinterpret_cast<std::byte*>(d_valid_counts) + valid_counts_size,
-                             std::byte{0});
+  thrust::uninitialized_fill(
+    rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+    reinterpret_cast<std::byte*>(d_valid_counts),
+    reinterpret_cast<std::byte*>(d_valid_counts) + valid_counts_size,
+    std::byte{0});
   if (d_error_slots != nullptr) {
     CUDF_CUDA_TRY(cudaMemcpyAsync(
       d_error_slots, error_check_slots.data(), error_bytes, cudaMemcpyDefault, stream.get()));
@@ -1816,7 +1817,9 @@ __device__ __forceinline__ bool signature_match(merged_trie_view const& trie,
  * Certifies byte-identical serialization of a parsed subtree; this is not a JSON validator.
  * Requires double-quoted strings/keys, canonical simple escapes, compact separators and unchanged
  * integers/literals. Single quotes, exterior whitespace, controls, Unicode/slash escapes, floats
- * and -0 return false for writer normalization. A true result permits a borrowed input view.
+ * and -0 return false for writer normalization. Bytes >= 0x80 are assumed to serialize verbatim;
+ * if the writer ever changes that (e.g. astral characters), raw eligibility must change with it.
+ * A true result permits a borrowed input view.
  */
 __device__ __forceinline__ bool certify_raw_subtree(char const* data, int32_t len)
 {
@@ -3082,8 +3085,8 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
 
   // The flat pair storage stays alive through the retry: the retry kernel overwrites the
   // flagged paths' pairs in place, and the rebuild below reads them after the retry.
-  // Clearing here releases only first-pass scratch_buffers; the retry-stage pair storage is
-  // a separate vector cleared after the rebuild.
+  // Clearing here releases the first-pass per-path scratch buffers; the flat pair storage the
+  // retry reads lives in out_stringviews and stays alive until the rebuild.
   scratch_buffers.clear();
 
   // The retry overwrites flagged paths' output pairs; rebuilt columns use those lengths and
@@ -3125,8 +3128,8 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
     output[out_idx] =
       cudf::strings::detail::make_strings_column(out_sview.begin(), out_sview.end(), stream, mr);
   }
-  // First-pass scratch and retry-stage views are unreferenced by the rebuilt columns.
-  scratch_buffers.clear();
+  // The rebuilt columns no longer reference the first-pass scratch buffers or the retry-stage
+  // views; out_stringviews's release below is the last consumer boundary.
   (void)out_stringviews.release();
   return output;
 }
